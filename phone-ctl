@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# phone-ctl — Android automation helper (adb-backed shim; the packaged CLI was absent).
+#
+# Usage:
+#   phone-ctl [-d N] <command> [args]      N = logical display id (0 = phone, 8 = DeX)
+#   phone-ctl dex <command> [args]         shorthand for -d 8
+#   phone-ctl both                         capture both displays
+#
+# Coordinates are given in the *last captured image* for that display and are scaled
+# back to physical pixels. Screenshots are native resolution (phone 1080x2340,
+# DeX 3840x2160).
+#
+# Host quirks handled here:
+#   * screencap prepends "[Warning] Multiple displays..." -> stripped, PNG kept valid.
+#   * screencap -d wants a SurfaceFlinger id (huge number), input -d wants the small
+#     logical id -> both are resolved from dumpsys and cached.
+#   * bare `input` targets the DeX display -> every event is pinned with `input -d N`.
+set -euo pipefail
+
+IMG_BASE=${PHONE_CTL_IMG:-/tmp/screen_agent}
+CACHE=/tmp/.phone-ctl
+
+DEV="${ANDROID_SERIAL:-}"
+if [ -z "$DEV" ]; then
+  DEV=$(adb devices | awk 'NR>1 && $2=="device" {print $1; exit}')
+fi
+[ -n "$DEV" ] || { echo "phone-ctl: no adb device attached" >&2; exit 1; }
+ADB=(adb -s "$DEV")
+
+DISP=${PHONE_CTL_DISPLAY:-0}
+# DeX 的逻辑 id 每次重启都会变（曾经是 8，后来是 6），所以动态解析：
+# 内部屏固定是 0，取另一个（id 最大的那个）作为 DeX 屏
+dex_id() {
+  local id
+  id=$(parse_displays 2>/dev/null | awk '$1!="0" {print $1}' | sort -n | tail -1)
+  echo "${id:-0}"
+}
+# （dex 的解析放在 parse_displays 定义之后再处理，见下方）
+if [ "${1:-}" = "-d" ] || [ "${1:-}" = "--display" ]; then DISP=$2; shift 2; fi
+
+read -r PW PH <<<"$("${ADB[@]}" shell wm size 2>/dev/null \
+  | sed -n 's/^Physical size: \([0-9]*\)x\([0-9]*\).*/\1 \2/p' | head -1)"
+
+parse_displays() {
+  "${ADB[@]}" shell dumpsys display 2>/dev/null | python3 -c '
+import sys, re
+out = sys.stdin.read()
+sf = dict((m.group(1), m.group(2)) for m in
+          re.finditer(r"DisplayDeviceInfo\{\"([^\"]*)\":.*?uniqueId=\"local:(\d+)\"", out))
+logical = dict((m.group(1), m.group(2)) for m in
+               re.finditer(r"mBaseDisplayInfo=DisplayInfo\{\"([^\"]*)\", displayId (\d+)", out))
+for name, lid in sorted(logical.items(), key=lambda kv: int(kv[1])):
+    print("%s %s %s" % (lid, sf.get(name, "-"), name))
+'
+}
+
+# DeX 解析必须放在 parse_displays 定义之后
+if [ "${1:-}" = "dex" ]; then DISP=$(dex_id); shift; fi
+
+# logical display id -> SurfaceFlinger id, cached briefly
+sf_id() {
+  local want=$1 cache="$CACHE.sf"
+  if ! { [ -f "$cache" ] && [ $(( $(date +%s) - $(stat -c %Y "$cache") )) -lt 300 ]; }; then
+    parse_displays > "$cache"
+  fi
+  awk -v d="$want" '$1==d {print $2; exit}' "$cache"
+}
+
+img_path() { echo "${IMG_BASE}_d${DISP}.png"; }
+dims_path() { echo "$CACHE.d${DISP}.dims"; }
+
+scale() {  # $1 = coordinate in the last captured image for this display
+  local iw
+  iw=$(awk '{print $1}' "$(dims_path)" 2>/dev/null || true)
+  [ -n "${iw:-}" ] || iw=$PW
+  awk -v v="$1" -v p="$PW" -v i="$iw" 'BEGIN{printf "%.0f", v*p/i}'
+}
+inject() { "${ADB[@]}" shell input -d "$DISP" "$@"; }
+
+do_capture() {  # $1 = logical display id
+  local d=$1 sf out raw
+  sf=$(sf_id "$d" || true)
+  out="${IMG_BASE}_d${d}.png"; raw="$out.raw"
+  : > "$raw"
+  if [ -n "$sf" ] && [ "$sf" != "-" ]; then
+    "${ADB[@]}" exec-out screencap -p -d "$sf" > "$raw" 2>/dev/null || true
+  fi
+  if [ ! -s "$raw" ]; then
+    "${ADB[@]}" exec-out screencap -p > "$raw"
+  fi
+  python3 - "$raw" "$out" "${CACHE}.d${d}.dims" <<'PY'
+import sys, struct
+raw = open(sys.argv[1], 'rb').read()
+i = raw.find(b'\x89PNG\r\n\x1a\n')
+if i < 0:
+    sys.exit('phone-ctl: screencap returned no PNG data')
+png = raw[i:]
+open(sys.argv[2], 'wb').write(png)
+w, h = struct.unpack('>II', png[16:24])
+open(sys.argv[3], 'w').write('%d %d\n' % (w, h))
+PY
+  rm -f "$raw"
+
+  # 手机息屏时 screencap 只会返回一张纯黑图（约 15KB），自动唤醒后重拍一次
+  if [ "$d" = "0" ] && [ "$(stat -c%s "$out")" -lt 40000 ]; then
+    "${ADB[@]}" shell input -d 0 keyevent 224 >/dev/null 2>&1 || true
+    sleep 1.2
+    sf=$(sf_id "$d" || true)
+    if [ -n "$sf" ] && [ "$sf" != "-" ]; then
+      "${ADB[@]}" exec-out screencap -p -d "$sf" > "$raw" 2>/dev/null || true
+    fi
+    [ -s "$raw" ] || "${ADB[@]}" exec-out screencap -p > "$raw"
+    python3 - "$raw" "$out" "${CACHE}.d${d}.dims" <<'PYPATCH'
+import sys, struct
+raw = open(sys.argv[1], 'rb').read()
+i = raw.find(b'\x89PNG\r\n\x1a\n')
+if i < 0:
+    sys.exit('no png')
+png = raw[i:]
+open(sys.argv[2], 'wb').write(png)
+w, h = struct.unpack('>II', png[16:24])
+open(sys.argv[3], 'w').write('%d %d\n' % (w, h))
+PYPATCH
+    rm -f "$raw"
+    echo "（检测到息屏，已唤醒并重拍）" >&2
+  fi
+
+  echo "$out ($(stat -c%s "$out") bytes) display=$d $(cat "${CACHE}.d${d}.dims")"
+}
+
+cmd=${1:-help}; shift || true
+case "$cmd" in
+  capture|cap)
+    if [ "$DISP" = "both" ]; then do_capture 0; do_capture "$(dex_id)"; else do_capture "$DISP"; fi ;;
+  both)    do_capture 0; do_capture "$(dex_id)" ;;
+  tap)     inject tap "$(scale "$1")" "$(scale "$2")"; echo "tap $1,$2 (display $DISP)" ;;
+  swipe)
+    inject swipe "$(scale "$1")" "$(scale "$2")" "$(scale "$3")" "$(scale "$4")" "${5:-300}"
+    echo "swipe $1,$2 -> $3,$4 (display $DISP)" ;;
+  back)    inject keyevent 4 ;;
+  home)    inject keyevent 3 ;;
+  recents) inject keyevent 187 ;;
+  enter)   inject keyevent 66 ;;
+  wake)    inject keyevent 224 ;;
+  text)    inject text "$1" ;;
+  key)     inject keyevent "$1" ;;
+  size)    echo "${PW}x${PH}" ;;
+  sh)      "${ADB[@]}" shell "$@" ;;
+  push)    "${ADB[@]}" push "$1" "$2" ;;
+  pull)    "${ADB[@]}" pull "$1" "$2" ;;
+  keepon)  "${ADB[@]}" shell svc power stayon true; echo "已开启常亮（充电时不息屏）" ;;
+  keepoff) "${ADB[@]}" shell svc power stayon false; echo "已关闭常亮" ;;
+  unlock)  "${ADB[@]}" shell input -d 0 keyevent 224 >/dev/null 2>&1 || true
+           sleep 0.6
+           "${ADB[@]}" shell input -d 0 swipe 540 1900 540 600 200 >/dev/null 2>&1 || true
+           echo "已尝试唤醒解锁" ;;
+  status)
+    "${ADB[@]}" devices | awk 'NR>1 && $2=="device" {printf "设备   : %s  %s\n", $1, $2}'
+    printf "分辨率 : %sx%s\n" "$PW" "$PH"
+    printf "唤醒   : %s\n" "$("${ADB[@]}" shell dumpsys power 2>/dev/null | sed -n 's/.*mWakefulness=\([A-Za-z]*\).*/\1/p' | head -1)"
+    parse_displays | while read -r lid sf name; do
+      printf "显示   : [%s] %-10s sf=%s\n" "$lid" "$name" "$sf"
+    done
+    ;;
+  displays) parse_displays ;;
+  focus)   "${ADB[@]}" shell dumpsys window | grep -m2 mCurrentFocus | sed 's/^ *//' ;;
+  *)
+    cat >&2 <<'USAGE'
+usage: phone-ctl [-d N | dex] <command>
+  capture | both | tap x y | swipe x1 y1 x2 y2 [ms] | back | home | recents
+  enter | wake | unlock | text S | key K | size | displays | focus
+  keepon | keepoff | status | sh CMD | push 本地 远端 | pull 远端 本地
+USAGE
+    exit 2 ;;
+esac
