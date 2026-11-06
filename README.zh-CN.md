@@ -11,7 +11,11 @@ phone-ctl dex capture    # 抓 DeX 显示器
 phone-ctl dex tap 2500 1500
 ```
 
-## 它解决的四个坑
+![demo](demo.gif)
+
+*横屏计算器，每一次点击都是标准的 ADB 事件。*
+
+## 它解决的五个坑
 
 | 现象 | 真正的原因 |
 |---|---|
@@ -19,6 +23,7 @@ phone-ctl dex tap 2500 1500
 | `screencap -d 0` 报 `Display Id '0' is not valid` | `-d` 要的是 **SurfaceFlinger id**（大数字），不是逻辑 id |
 | 在手机屏上 `input tap` 没反应 | 输入默认打到**当前焦点所在显示器**，DeX 下就是外接屏 |
 | `uiautomator dump` 抓到别的 App | 它抓的是**焦点窗口**，不是"手机"；`--display 0` 会被静默忽略 |
+| 旋转后点击全错位 | 截图空间跟着屏幕转（2340×1080），但按 `wm size`（1080×2340）缩放就会点进缝里 |
 
 ## 安装
 
@@ -35,6 +40,8 @@ git clone https://github.com/<you>/phone-ctl.git && cd phone-ctl
 `dumpsys display`，按显示器名字配对并缓存。
 
 **外接屏的逻辑 id 每次重启都会变**（我这里是 8 → 6），所以 `dex` 是动态解析的，不写死。
+
+**旋转不改坐标**：`screencap` 和 `input` 共用同一个"当前旋转方向"的坐标空间，截图坐标可直接 1:1 使用。
 
 **黑图自动重试**：截图小于 40KB 判定为息屏，自动唤醒重拍一次。
 

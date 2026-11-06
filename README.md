@@ -12,6 +12,10 @@ phone-ctl dex capture             # screenshot the DeX monitor instead
 phone-ctl dex tap 2500 1500       # tap on the monitor
 ```
 
+![demo](demo.gif)
+
+*Driving a landscape calculator through `phone-ctl tap` — every tap is a plain ADB event.*
+
 [中文说明](README.zh-CN.md)
 
 ---
@@ -27,6 +31,7 @@ probably hit all four of these:
 | `screencap -d 0` → `Display Id '0' is not valid` | `-d` wants a **SurfaceFlinger** id (huge number), not the logical display id. |
 | `input tap` does nothing on the phone screen | Input defaults to the **focused display**. With DeX attached, that's the monitor. |
 | `uiautomator dump` returns another app's UI | It dumps the **currently focused window**, not "the phone". `--display 0` is silently ignored. |
+| Taps land on the wrong key after rotation | Screenshot space rotates with the screen (2340×1080), but naive code scales by `wm size` (1080×2340). |
 
 `phone-ctl` handles all four.
 
@@ -93,7 +98,13 @@ Every injected event is pinned: `adb shell input -d <logical-id> ...`.
 If a capture comes back under 40 KB, it's almost certainly a powered-off display. `phone-ctl` wakes
 the device and retries once, logging `（检测到息屏，已唤醒并重拍）`.
 
-**4. The `screencap` warning prefix.**
+**4. Rotation changes the coordinate space.**
+`screencap` and `input` share the **same rotated space**: landscape screenshot is 2340×1080, and
+`input tap 1241 651` means the same 2341×1081 grid. Scaling coordinates by `wm size` (which reports
+the natural 1080×2340) sends taps into the gaps between keys. `phone-ctl` uses screenshot
+coordinates 1:1.
+
+**5. The `screencap` warning prefix.**
 With multiple displays attached, `screencap -p` prepends:
 
 ```
